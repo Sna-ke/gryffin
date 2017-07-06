@@ -9,29 +9,19 @@ package gryffin
 
 import (
 	"bytes"
-	// "fmt"
-	// "encoding/hex"
 	"encoding/json"
+	"fmt"
 	"hash/fnv"
 	"io/ioutil"
-	// "log"
-	"fmt"
-	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
-	// "os"
-	// "strings"
 
-	"github.com/yahoo/gryffin/data"
 	"github.com/yahoo/gryffin/html-distance"
 )
-
-// TODO, add https://godoc.org/github.com/mfonda/simhash
-// TODO, add it via vendoring.
 
 // A Scan consists of the job, target, request and response.
 type Scan struct {
@@ -46,18 +36,13 @@ type Scan struct {
 	Cookies      []*http.Cookie
 	Fingerprint  Fingerprint
 	HitCount     int
-	Session      data.Store
-	LogWriter    io.Writer
 }
 
 // Job stores the job id and config (if any).
 type Job struct {
 	ID             string
 	DomainsAllowed []string // Domains that we would crawl
-	// Config         Config   // unused currently. It would store job meta data.
 }
-
-// type Config map[string]string
 
 // Fingerprint contains all the different types of hash for the Scan (Request & Response)
 type Fingerprint struct {
@@ -66,15 +51,7 @@ type Fingerprint struct {
 	Request            uint64 // method, url, body
 	RequestFull        uint64 // request + header
 	ResponseSimilarity uint64
-	//  TODO - add simhash here.
 }
-
-// // Issue stores the findings from the fuzzer.
-// type Issue struct {
-// 	// TODO - implement this
-// 	// *Job
-// 	// *WebSite
-// }
 
 // HTTPDoer interface is to be implemented by http.Client
 type HTTPDoer interface {
@@ -94,47 +71,23 @@ type Renderer interface {
 	GetLinks() <-chan *Scan
 }
 
-// // Storage is an interface for storing sessions and persistent objects
-// type Storage interface {
-// 	Get(key string) (value interface{}, ok bool)
-// 	Set(key string, value interface{})
-// }
-
 // LogMessage contains the data fields to be marshall as a json for forwarding to the log processor.
 type LogMessage struct {
 	Service string
 	Msg     string
+	Method  string
+	Url     string
+	JobID   string
 	// Fingerprint Fingerprint
-	Method string
-	Url    string
 }
 
-// // Logger is an interface for writing logs.
-// // In full deployment mode, logger may send events to other receivers.
-// type Logger interface {
-// 	Log(...interface{})
-// 	Logf(string, ...interface{})
-// }
-
-// // StdLogger is a simple logger that writes to stdout.
-// type StdLogger struct{}
-
-// // Log calls log.Println
-// func (s *StdLogger) Log(v ...interface{}) {
-// 	log.Println(v...)
-// }
-
-// // Logf calls log.Printf
-// func (s *StdLogger) Logf(format string, v ...interface{}) {
-// 	log.Printf(format, v...)
-// }
-
-// TODO
-// similarity oracle. Will move these to interface and let the main package create it.
-var oracle = distance.NewOracle()
-
 // NewScan creates a scan.
-func NewScan(method, url, post string, session data.Store, writer io.Writer) *Scan {
+func NewScan(method, url, post string) *Scan {
+
+	// ensure we got a memory store..
+	if memoryStore == nil {
+		memoryStore = NewGryffinStore()
+	}
 
 	id := GenRandomID()
 
@@ -147,7 +100,12 @@ func NewScan(method, url, post string, session data.Store, writer io.Writer) *Sc
 	}
 
 	// put the host component of the url as the domains to be allowed
-	job.DomainsAllowed = []string{strings.SplitN(req.URL.Host, ":", 2)[0]}
+	host, _, err := net.SplitHostPort(req.URL.Host)
+	if err != nil {
+		job.DomainsAllowed = []string{req.URL.Host}
+	} else {
+		job.DomainsAllowed = []string{host}
+	}
 
 	// // Add chrome user agent
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/44.0.2403.107 Safari/537.36")
@@ -157,25 +115,12 @@ func NewScan(method, url, post string, session data.Store, writer io.Writer) *Sc
 		Job:         job,
 		Request:     req,
 		RequestBody: post,
-		Session:     session,
-		LogWriter:   writer,
 	}
-}
-
-func NewScanFromJson(b []byte, base *Scan) *Scan {
-	var scan Scan
-	json.Unmarshal(b, &scan)
-	if base != nil {
-		scan.LogWriter = base.LogWriter
-		scan.Session = base.Session
-	}
-	// fmt.Printf("Cookie: %v\n", scan.Cookies)
-	return &scan
 }
 
 // getOrigin returns the Origin of the URL (scheme, hostname, port )
 func getOrigin(u *url.URL) string {
-	return u.Scheme + u.Host
+	return u.Scheme + "://" + u.Host
 }
 
 // MergeRequest merge the request field in scan with the existing one.
@@ -190,8 +135,11 @@ func (s *Scan) MergeRequest(req *http.Request) {
 	// read the request body, and then reset the reader
 	var post []byte
 	if req.Body != nil {
-		if post, err := ioutil.ReadAll(req.Body); err != nil {
+		if post, err := ioutil.ReadAll(req.Body); err == nil {
 			req.Body = ioutil.NopCloser(bytes.NewReader(post))
+		} else {
+			// only possible error is bytes.ErrTooLarge from ioutil package.
+			s.Error("MergeRequest", err)
 		}
 	}
 
@@ -257,8 +205,6 @@ func (s *Scan) Spawn() *Scan {
 		Request:     &req,
 		RequestBody: post,
 		Cookies:     cookies,
-		Session:     s.Session,
-		LogWriter:   s.LogWriter,
 	}
 }
 
@@ -274,7 +220,7 @@ func (s *Scan) Poke(client HTTPDoer) (err error) {
 	}
 
 	// delete the similarity case for the domain.
-	s.Session.DelPrefix("hash/unique/" + s.Request.URL.Host)
+	// s.Session.DelPrefix("hash/unique/" + s.Request.URL.Host)
 
 	// http.Request is embeded in a Request embeded in a Scan.
 	s.Response, err = client.Do(s.Request)
@@ -288,21 +234,6 @@ func (s *Scan) Poke(client HTTPDoer) (err error) {
 	s.HitCount++
 	return
 }
-
-/*
-// LogWriter writes log.
-type LogWriter struct{}
-
-// Write sends JSON message to the logger machine.
-func (w *LogWriter) Write(p []byte) (n int, err error) {
-	n, err = os.Stdout.Write(p)
-	// n = len(p)
-	return
-}
-
-// Logger is the default logger for this package.
-var Logger = log.New(&LogWriter{}, "", log.LstdFlags)
-*/
 
 // ReadResponseBody read Response.Body and fill it to ReadResponseBody.
 // It will also reconstruct the io.ReaderCloser stream.
@@ -351,27 +282,32 @@ func (s *Scan) UpdateFingerprint() {
 // RateLimit checks whether we are under the allowed rate for crawling the site.
 // It returns a delay time to wait to check for ReadyToCrawl again.
 func (s *Scan) RateLimit() int {
-	store := s.Session
-	// for each 5 second epoch, we create a key and see how many crawls are done.
-	ts := time.Now().Truncate(5 * time.Second).Unix()
-	k := "rate/" + s.Request.URL.Host + "/" + strconv.FormatInt(ts, 10)
-	if v, ok := store.Get(k); ok {
-		if v.(int64) >= 5 {
-			// s.Logm("RateLimit", "Delay 5 second")
-			// s.Logf("Wait for 5 second for %s (v:%d)", s.Request.URL, v)
-			return 5
-		}
-		// ready to crawl.
-		// TODO - this is not atomic.
-		c, _ := store.Get(k)
-		store.Set(k, c.(int64)+1)
-		// s.Logm("RateLimit", "No Delay")
+	if memoryStore.Hit(s.Request.URL.Host) {
 		return 0
 	}
+	return 5
 
-	store.Set(k, 1)
-	// s.Logm("RateLimit", "No Delay")
-	return 0
+	// store := s.Session
+	// // for each 5 second epoch, we create a key and see how many crawls are done.
+	// ts := time.Now().Truncate(5 * time.Second).Unix()
+	// k := "rate/" + s.Request.URL.Host + "/" + strconv.FormatInt(ts, 10)
+	// if v, ok := store.Get(k); ok {
+	// 	if v.(int64) >= 5 {
+	// 		// s.Logm("RateLimit", "Delay 5 second")
+	// 		// s.Logf("Wait for 5 second for %s (v:%d)", s.Request.URL, v)
+	// 		return 5
+	// 	}
+	// 	// ready to crawl.
+	// 	// TODO - this is not atomic.
+	// 	c, _ := store.Get(k)
+	// 	store.Set(k, c.(int64)+1)
+	// 	// s.Logm("RateLimit", "No Delay")
+	// 	return 0
+	// }
+
+	// store.Set(k, 1)
+	// // s.Logm("RateLimit", "No Delay")
+	// return 0
 }
 
 // IsScanAllowed check if the request URL is allowed per Job.DomainsAllowed.
@@ -381,7 +317,11 @@ func (s *Scan) IsScanAllowed() bool {
 		return true
 	}
 
-	host := strings.SplitN(s.Request.URL.Host, ":", 2)[0]
+	host, _, err := net.SplitHostPort(s.Request.URL.Host)
+	if err != nil {
+		host = s.Request.URL.Host
+	}
+
 	for _, allowed := range s.Job.DomainsAllowed {
 		if host == allowed {
 			return true
@@ -402,37 +342,16 @@ func (s *Scan) CrawlAsync(r Renderer) {
 
 // IsDuplicatedPage checks if we should proceed based on the Response
 func (s *Scan) IsDuplicatedPage() bool {
-
 	s.UpdateFingerprint()
-	store := s.Session
-
 	f := s.Fingerprint.ResponseSimilarity
-	// TODO - tune the proximity score...
-	if !oracle.Seen(f, 2) {
-		k := "hash/unique/" + s.Request.URL.Host + "/" + strconv.FormatUint(s.Fingerprint.ResponseSimilarity, 16)
-		store.Set(k, true)
-		oracle.See(f)
+	if !memoryStore.Seen(s.Job.ID, "oracle", f, 2) {
+		memoryStore.See(s.Job.ID, "oracle", f)
 		s.Logm("IsDuplicatedPage", "Unique Page")
 		return false
+	} else {
+		s.Logm("IsDuplicatedPage", "Duplicate Page")
 	}
-
 	return true
-}
-
-// IsUnique checks if the response is unique or not.
-func (s *Scan) IsUnique() bool {
-	s.UpdateFingerprint()
-	store := s.Session
-
-	k := "hash/unique/" + s.Request.URL.Host + "/" + strconv.FormatUint(s.Fingerprint.ResponseSimilarity, 16)
-
-	if _, ok := store.Get(k); ok {
-		// s.Logger.Logf("Uniqueness is %t, %s", true, s.Request.URL)
-		return true
-	}
-
-	// s.Logger.Logf("Uniqueness is %t, %s", false, s.Request.URL)
-	return false
 }
 
 // Scan runs the vulnerability fuzzer, return the issue count
@@ -447,28 +366,19 @@ func (s *Scan) Fuzz(fuzzer Fuzzer) (int, error) {
 // 	return
 // }
 
-// ApplyLinkRules checks if the links should be queued for next crawl.
-func (s *Scan) ApplyLinkRules() bool {
+// ShouldCrawl checks if the links should be queued for next crawl.
+func (s *Scan) ShouldCrawl() bool {
 
 	s.UpdateFingerprint()
-	store := s.Session
-
-	// k := "hash/" + hex.EncodeToString(s.Fingerprint.URL)
-	k := "hash/url/" + strconv.FormatUint(s.Fingerprint.URL, 16)
-
-	// link seen before.
-	if _, ok := store.Get(k); ok {
-		// s.Logm("LinkRules", "Duplicated")
-		return false
+	f := s.Fingerprint.URL
+	if !memoryStore.Seen(s.Job.ID, "hash", f, 0) {
+		memoryStore.See(s.Job.ID, "hash", f)
+		s.Logm("ShouldCrawl", "Unique Link")
+		return true
+	} else {
+		s.Logm("ShouldCrawl", "Duplicate Link")
 	}
-	store.Set(k, true)
-	return true
-}
-
-func (s *Scan) Json() []byte {
-	b, _ := json.Marshal(s)
-	return b
-
+	return false
 }
 
 // TODO - LogFmt (fmt string)
@@ -491,6 +401,7 @@ func (s *Scan) Logm(service, msg string) {
 		// Fingerprint: s.Fingerprint,
 		Method: s.Request.Method,
 		Url:    s.Request.URL.String(),
+		JobID:  s.Job.ID,
 	}
 	s.Log(m)
 }
@@ -501,9 +412,9 @@ func (s *Scan) Logf(format string, a ...interface{}) {
 }
 
 func (s *Scan) Log(v interface{}) {
-	if s.LogWriter == nil {
+	if logWriter == nil {
 		return
 	}
-	encoder := json.NewEncoder(s.LogWriter)
+	encoder := json.NewEncoder(logWriter)
 	encoder.Encode(v)
 }

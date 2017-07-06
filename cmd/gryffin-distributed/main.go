@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -19,7 +20,6 @@ import (
 	"github.com/bitly/go-nsq"
 
 	"github.com/yahoo/gryffin"
-	"github.com/yahoo/gryffin/data"
 	"github.com/yahoo/gryffin/fuzzer/arachni"
 	"github.com/yahoo/gryffin/fuzzer/sqlmap"
 	"github.com/yahoo/gryffin/renderer"
@@ -34,6 +34,7 @@ var wq chan bool
 var t *gryffin.Scan
 
 var logWriter io.Writer
+var store *gryffin.GryffinStore
 
 // var method = flag.String("method", "GET", "the HTTP method for the request.")
 // var url string
@@ -73,9 +74,15 @@ func newProducer() *nsq.Producer {
 }
 
 func newConsumer(topic, channel string, handler nsq.HandlerFunc) *nsq.Consumer {
-	consumer, _ := nsq.NewConsumer(topic, channel, nsq.NewConfig())
+	var err error
+	consumer, err := nsq.NewConsumer(topic, channel, nsq.NewConfig())
+	if err != nil {
+		fmt.Println("Cannot create consumer", err)
+		return nil
+	}
+
 	consumer.AddHandler(handler)
-	err := consumer.ConnectToNSQLookupd("127.0.0.1:4161")
+	err = consumer.ConnectToNSQLookupd("127.0.0.1:4161")
 	if err != nil {
 		fmt.Println("Cannot connect to NSQ for consuming message", err)
 		return nil
@@ -101,13 +108,45 @@ func seed(url string) {
 
 }
 
+func shareCache() {
+
+	var producer *nsq.Producer
+	var consumer *nsq.Consumer
+
+	handler := nsq.HandlerFunc(func(m *nsq.Message) error {
+		store.GetRcvChan() <- m.Body
+		return nil
+	})
+
+	producer = newProducer()
+
+	go func() {
+		for {
+			// fmt.Println("SndChan: ", store.GetSndChan(), string(json))
+			err := producer.Publish("share-cache", <-store.GetSndChan())
+			if err != nil {
+				fmt.Println("Could not publish", "share-cache", err)
+			}
+		}
+	}()
+
+	rand.Seed(time.Now().UnixNano())
+
+	consumer = newConsumer("share-cache", fmt.Sprintf("%06d#ephemeral", rand.Int()%999999), handler)
+	_ = consumer
+
+	// defer producer.Stop()
+	// defer consumer.Stop()
+
+}
+
 func crawl() {
 
 	var producer *nsq.Producer
 	var consumer *nsq.Consumer
 
 	handler := nsq.HandlerFunc(func(m *nsq.Message) error {
-		scan := gryffin.NewScanFromJson(m.Body, t)
+		scan := gryffin.NewScanFromJson(m.Body)
 
 		if delay := scan.RateLimit(); delay != 0 {
 			go func() {
@@ -133,16 +172,16 @@ func crawl() {
 			}()
 
 			go func() {
-				isUnique := false
+
+				//
+				// Renderer will close all channels when a page is duplicated.
+				// Therefore we don't need to test whether the link is coming
+				// from a duplicated page or not
 				for s := range r.GetLinks() {
-					// do the evaluation once only.
-					isUnique = isUnique || scan.IsUnique()
-					if isUnique {
-						if ok := s.ApplyLinkRules(); ok {
-							err := producer.Publish("seed", s.Json())
-							if err != nil {
-								fmt.Println("Could not publish", "seed", err)
-							}
+					if ok := s.ShouldCrawl(); ok {
+						err := producer.Publish("seed", s.Json())
+						if err != nil {
+							fmt.Println("Could not publish", "seed", err)
 						}
 					}
 				}
@@ -166,7 +205,7 @@ func fuzzWithSqlmap() {
 	var consumer *nsq.Consumer
 	handler := nsq.HandlerFunc(func(m *nsq.Message) error {
 		wq <- true
-		scan := gryffin.NewScanFromJson(m.Body, t)
+		scan := gryffin.NewScanFromJson(m.Body)
 		f := &sqlmap.Fuzzer{}
 		f.Fuzz(scan)
 		<-wq
@@ -181,7 +220,7 @@ func fuzzWithArachni() {
 	var consumer *nsq.Consumer
 	handler := nsq.HandlerFunc(func(m *nsq.Message) error {
 		wq <- true
-		scan := gryffin.NewScanFromJson(m.Body, t)
+		scan := gryffin.NewScanFromJson(m.Body)
 		f := &arachni.Fuzzer{}
 		f.Fuzz(scan)
 		<-wq
@@ -224,11 +263,13 @@ func main() {
 		logWriter = io.MultiWriter(os.Stdout, tcpout)
 	}
 
+	gryffin.SetLogWriter(logWriter)
+
 	// we use a buffered channel to block when max concurrency is reach.
 	maxconcurrency := 5
 	wq = make(chan bool, maxconcurrency)
 
-	t = gryffin.NewScan("GET", url, "", data.NewMemoryStore(), logWriter)
+	t = gryffin.NewScan("GET", url, "")
 
 	// seed is unique case that we exit the program immediately
 	if service == "seed" {
@@ -236,11 +277,15 @@ func main() {
 		return
 	}
 
+	store = gryffin.NewSharedGryffinStore()
+	gryffin.SetMemoryStore(store)
+
 	captureCtrlC()
 
 	switch service {
 
 	case "crawl":
+		shareCache()
 		crawl()
 
 	case "fuzz-sqlmap":

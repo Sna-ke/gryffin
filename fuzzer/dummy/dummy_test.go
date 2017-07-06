@@ -5,7 +5,6 @@
 package dummy
 
 import (
-	"os"
 	"testing"
 
 	"github.com/yahoo/gryffin"
@@ -14,7 +13,7 @@ import (
 func TestFuzzer(t *testing.T) {
 
 	f := &Fuzzer{}
-	scan := gryffin.NewScan("GET", "http://www.yahoo.com", "", nil, os.Stdout)
+	scan := gryffin.NewScan("GET", "http://www.yahoo.com", "")
 	_, err := f.Fuzz(scan)
 	if err != nil {
 		t.Error(err)

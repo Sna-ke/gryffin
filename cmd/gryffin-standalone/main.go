@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/yahoo/gryffin"
-	"github.com/yahoo/gryffin/data"
 	"github.com/yahoo/gryffin/fuzzer/arachni"
 	"github.com/yahoo/gryffin/fuzzer/sqlmap"
 	"github.com/yahoo/gryffin/renderer"
@@ -53,37 +52,33 @@ func linkChannels(s *gryffin.Scan) {
 	go func() {
 
 		for scan := range chanCrawl {
-			// scan := <-chanCrawl
 			r := &renderer.PhantomJSRenderer{Timeout: 10}
-			// r := &renderer.NoScriptRenderer{}
 			scan.CrawlAsync(r)
 
 			go func() {
 				if s := <-r.GetRequestBody(); s != nil {
+					// add two workers (two fuzzers)
+					wg.Add(2)
 					chanFuzz <- s
-				} else {
-					wg.Done()
 				}
 
 			}()
 
 			go func() {
-				isUnique := false
+
+				//
+				// Renderer will close all channels when a page is duplicated.
+				// Therefore we don't need to test whether the link is coming
+				// from a duplicated page or not
 				for newScan := range r.GetLinks() {
-
-					// do the evaluation once only.
-					isUnique = isUnique || scan.IsUnique()
-
-					if isUnique {
-
-						if ok := newScan.ApplyLinkRules(); ok {
-							wg.Add(1)
-							chanRateLimit <- newScan
-						}
+					if ok := newScan.ShouldCrawl(); ok {
+						// add one workers (a new crawl)
+						wg.Add(1)
+						chanRateLimit <- newScan
 					}
-
 				}
-
+				// remove one worker (finish crawl)
+				wg.Done()
 				scan.Logm("Get Links", "Finished")
 
 			}()
@@ -98,13 +93,15 @@ func linkChannels(s *gryffin.Scan) {
 			go func() {
 				f := &arachni.Fuzzer{}
 				f.Fuzz(scan)
+				// remove a fuzzer worker.
 				wg.Done()
 			}()
 			go func() {
 				f := &sqlmap.Fuzzer{}
 				f.Fuzz(scan)
+				// remove a fuzzer worker.
+				wg.Done()
 			}()
-			// Finished crawling a link...
 		}
 
 	}()
@@ -143,6 +140,8 @@ func linkChannels(s *gryffin.Scan) {
 
 	chanStart <- s
 	close(chanStart)
+
+	// add one worker (start crawl)
 	wg.Add(1)
 	wg.Wait()
 }
@@ -161,17 +160,25 @@ func main() {
 
 	}
 
+	fmt.Println("=== Running Gryffin ===")
+
+	var w io.Writer
 	// TCP port listening messages.
 	tcpout, err := net.Dial("tcp", "localhost:5000")
 	if err != nil {
-		fmt.Println("Cannot establish tcp connection to log listener.")
+		// fmt.Println("Cannot establish tcp connection to log listener.")
+		w = os.Stdout
+	} else {
+		w = io.MultiWriter(os.Stdout, tcpout)
 	}
 
-	w := io.MultiWriter(os.Stdout, tcpout)
+	gryffin.SetLogWriter(w)
 
-	scan := gryffin.NewScan(*method, url, *body, data.NewMemoryStore(), w)
+	scan := gryffin.NewScan(*method, url, *body)
 	scan.Logm("Main", "Started")
 
 	linkChannels(scan)
+
+	fmt.Println("=== End Running Gryffin ===")
 
 }

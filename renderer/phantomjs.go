@@ -7,9 +7,12 @@ package renderer
 import (
 	"encoding/json"
 	"io"
+	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +26,7 @@ import (
 type PhantomJSRenderer struct {
 	BaseRenderer
 	Timeout int
+	process *os.Process
 }
 
 type input struct {
@@ -39,13 +43,24 @@ type inputHeaders struct {
 }
 
 type details struct {
-	Links []link
-	Forms []string
+	Links        []link
+	Forms        []form
+	ChildFrames  []link
+	SubResources []link
+	Redirects    []link
+	MainFrame    []link
 }
 
 type link struct {
 	Text string
 	Url  string
+}
+
+type form struct {
+	Data     string
+	DataType string
+	Method   string
+	Url      string
 }
 
 type response struct {
@@ -67,13 +82,13 @@ type domMessage struct {
 	Action   string
 	Events   []string
 	KeyChain []string
-	Links    []link
 	JSError  []string
 }
 
 type message struct {
 	*responseMessage
 	*domMessage
+	*details
 	Signature string
 	MsgType   string
 }
@@ -108,6 +123,29 @@ func (m *response) fill(s *gryffin.Scan) {
 
 }
 
+func (f *form) toScan(parent *gryffin.Scan) *gryffin.Scan {
+	m := strings.ToUpper(f.Method)
+	u := f.Url
+	var r io.Reader
+	if m == "POST" {
+		r = ioutil.NopCloser(strings.NewReader(f.Data))
+	} else {
+		parsed, err := url.Parse(u)
+		if err == nil {
+			parsed.RawQuery = f.Data
+			u = parsed.String()
+		}
+	}
+
+	if req, err := http.NewRequest(m, u, r); err == nil {
+		s := parent.Spawn()
+		s.MergeRequest(req)
+		return s
+	}
+	// invalid url
+	return nil
+}
+
 func (l *link) toScan(parent *gryffin.Scan) *gryffin.Scan {
 	if req, err := http.NewRequest("GET", l.Url, nil); err == nil {
 		s := parent.Spawn()
@@ -118,10 +156,76 @@ func (l *link) toScan(parent *gryffin.Scan) *gryffin.Scan {
 	return nil
 }
 
+func (r *PhantomJSRenderer) extract(stdout io.ReadCloser, s *gryffin.Scan) {
+
+	defer close(r.done)
+
+	dec := json.NewDecoder(stdout)
+	for {
+		var m message
+		err := dec.Decode(&m)
+		if err == io.EOF {
+			return
+		} else {
+			if m.responseMessage != nil {
+				m.Response.fill(s)
+				if s.IsDuplicatedPage() {
+					return
+				}
+				r.chanResponse <- s
+				r.parseDetails(&m.Response.Details, s)
+			}
+
+			if m.details != nil {
+				r.parseDetails(m.details, s)
+			}
+		}
+	}
+}
+
+func (r *PhantomJSRenderer) parseDetails(d *details, s *gryffin.Scan) {
+	v := reflect.ValueOf(*d)
+	for i := 0; i < v.NumField(); i++ {
+		if links, ok := v.Field(i).Interface().([]link); ok {
+			for _, link := range links {
+				if newScan := link.toScan(s); newScan != nil && newScan.IsScanAllowed() {
+					r.chanLinks <- newScan
+				}
+			}
+		}
+		if forms, ok := v.Field(i).Interface().([]form); ok {
+			for _, form := range forms {
+				if newScan := form.toScan(s); newScan != nil && newScan.IsScanAllowed() {
+					r.chanLinks <- newScan
+				}
+			}
+		}
+	}
+}
+
+func (r *PhantomJSRenderer) kill(reason string, s *gryffin.Scan) {
+	if err := r.process.Kill(); err == nil {
+		s.Logmf("PhantomjsRenderer.Do", "[%s] Terminating the crawl process.", reason)
+	}
+}
+
+func (r *PhantomJSRenderer) wait(s *gryffin.Scan) {
+
+	select {
+	case <-r.done:
+		r.kill("Cleanup", s)
+	case <-time.After(time.Duration(r.Timeout) * time.Second):
+		r.kill("Timeout", s)
+	}
+	close(r.chanResponse)
+	close(r.chanLinks)
+}
+
 func (r *PhantomJSRenderer) Do(s *gryffin.Scan) {
 
 	r.chanResponse = make(chan *gryffin.Scan, 10)
 	r.chanLinks = make(chan *gryffin.Scan, 10)
+	r.done = make(chan string)
 
 	// Construct the command.
 	// render.js http(s)://<host>[:port][/path] [{"method":"post", "data":"a=1&b=2"}]
@@ -152,6 +256,9 @@ func (r *PhantomJSRenderer) Do(s *gryffin.Scan) {
 	s.Logmf("PhantomjsRenderer.Do", "Running: render.js")
 
 	cmd := exec.Command(
+		"phantomjs",
+		"--ssl-protocol=any",
+		"--ignore-ssl-errors=true",
 		os.Getenv("GOPATH")+"/src/github.com/yahoo/gryffin/renderer/resource/render.js",
 		url,
 		string(opt))
@@ -167,64 +274,13 @@ func (r *PhantomJSRenderer) Do(s *gryffin.Scan) {
 		return
 	}
 
-	kill := func(reason string) {
-		if err := cmd.Process.Kill(); err != nil {
-			// TODO - forgive "os: process already finished"
-			s.Error("PhantomjsRenderer.Do", err)
-			// log.Printf("error: %s", err)
-		} else {
-			s.Logmf("PhantomjsRenderer.Do", "[%s] Terminating the crawl process.", reason)
-		}
-	}
-	// Kill when timeout
-	_ = time.Second
-	if r.Timeout != 0 {
-		timeout := func() {
-			<-time.After(time.Duration(r.Timeout) * time.Second)
-			kill("Timeout")
-		}
-		go timeout()
-	}
+	r.process = cmd.Process
 
-	crawl := func() {
-		defer close(r.chanResponse)
-		defer close(r.chanLinks)
+	// wait until done or timeout.
+	go r.extract(stdout, s)
+	go r.wait(s)
 
-		dec := json.NewDecoder(stdout)
-
-		for {
-			var m message
-			err := dec.Decode(&m)
-			if err == io.EOF {
-				return
-				break
-			} else {
-				if m.responseMessage != nil {
-					m.Response.fill(s)
-					if s.IsDuplicatedPage() {
-						kill("Duplicated")
-						return
-					}
-					s.Logm("PhantomjsRenderer.Do.UniqueCrawl", m.MsgType)
-					r.chanResponse <- s
-					for _, link := range m.Response.Details.Links {
-						if newScan := link.toScan(s); newScan != nil && newScan.IsScanAllowed() {
-							r.chanLinks <- newScan
-						}
-					}
-				} else if m.domMessage != nil {
-					for _, link := range m.domMessage.Links {
-						if newScan := link.toScan(s); newScan != nil && newScan.IsScanAllowed() {
-							r.chanLinks <- newScan
-						}
-					}
-				}
-			}
-		}
-
-		cmd.Wait()
-	}
-
-	go crawl()
+	// cmd.Wait will close the stdout pipe.
+	go cmd.Wait()
 
 }

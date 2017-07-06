@@ -1,4 +1,4 @@
-Gryffin (beta)
+Gryffin (beta) [![Build Status](https://travis-ci.org/yahoo/gryffin.svg?branch=master)](https://travis-ci.org/yahoo/gryffin) [![GoDoc](https://godoc.org/github.com/yahoo/gryffin?status.svg)](https://godoc.org/github.com/yahoo/gryffin)
 ==========
 
 Gryffin is a large scale web security scanning platform. It is not yet another scanner. It was written to solve two specific problems with existing scanners: coverage and scale. 
@@ -51,10 +51,12 @@ Gryffin is built on the publisher-subscriber model. Each component is either a p
 ### Installation
 
 ```
-go get github.com/yahoo/gryffin/...
+go get -u github.com/yahoo/gryffin/...
 ```
 
 ### Run
+
+(WIP)
 
 ## TODO 
 
@@ -65,6 +67,10 @@ go get github.com/yahoo/gryffin/...
 5. Documentation for html-distance
 6. Implement a JSON serializable cookiejar. 
 7. Identify duplicate url patterns based on simhash result.
+
+## Talks and Slides
+
+- AppsecUSA 2015: [abstract](http://sched.co/3Vgm), [slide](http://go-talks.appspot.com/github.com/yukinying/talks/gryffin/gryffin.slide), [recording](https://youtu.be/IWiR2CPOHvc)
 
 ## Credits 
 
